@@ -1,3 +1,5 @@
+// Created by Huang Jiahua(https://github.com/huangjiahua)
+
 // This is free and unencumbered software released into the public domain.
 
 // Anyone is free to copy, modify, publish, use, compile, sell, or
@@ -24,7 +26,6 @@
 // C++ implementation of Rust's mpsc channel used to sync between threads
 // the Rust's version is at https://doc.rust-lang.org/std/sync/mpsc/
 
-// created by Huang Jiahua(https://github.com/huangjiahua)
 #ifndef MPSC_CHANNEL_H
 #define MPSC_CHANNEL_H
 
@@ -64,6 +65,16 @@ public:
         prev_head->next.store(node, std::memory_order_release);
     }
 
+    void
+    enqueue(T &&input) {
+        buffer_node_t *node = reinterpret_cast<buffer_node_t *>(new buffer_node_aligned_t);
+        node->data = input;
+        node->next.store(nullptr, std::memory_order_relaxed);
+
+        buffer_node_t *prev_head = _head.exchange(node, std::memory_order_acq_rel);
+        prev_head->next.store(node, std::memory_order_release);
+    }
+
     bool
     dequeue(T &output) {
         buffer_node_t *tail = _tail.load(std::memory_order_relaxed);
@@ -74,6 +85,21 @@ public:
         }
 
         output = next->data;
+        _tail.store(next, std::memory_order_release);
+        delete tail;
+        return true;
+    }
+
+    bool
+    dequeue_moved(T &output) {
+        buffer_node_t *tail = _tail.load(std::memory_order_relaxed);
+        buffer_node_t *next = tail->next.load(std::memory_order_acquire);
+
+        if (next == nullptr) {
+            return false;
+        }
+
+        output = std::move(next->data);
         _tail.store(next, std::memory_order_release);
         delete tail;
         return true;
@@ -151,6 +177,14 @@ public:
         this->chan_->cond.notify_one();
     }
 
+    void Send(T &&elem) {
+        {
+            std::lock_guard<std::mutex> lk(this->chan_->mut);
+            this->chan_->queue.enqueue(elem);
+        }
+        this->chan_->cond.notify_one();
+    }
+
 private:
     using ChannelPtr = std::shared_ptr<__channel_inner<T>>;
 
@@ -186,9 +220,9 @@ public:
             return;
         }
         std::unique_lock<std::mutex> lk(this->chan_->mut);
-        this->chan_->cond.wait(lk);
-        bool r = this->chan_->queue.dequeue(elem);
-        assert(r);
+        this->chan_->cond.wait(lk, [&]() {
+            return chan_->queue.dequeue_moved(elem);
+        });
     }
 
     template<class Rep, class Period>
@@ -197,13 +231,10 @@ public:
             return true;
         }
         std::unique_lock<std::mutex> lk(this->chan_->mut);
-        std::cv_status stat = this->chan_->cond.wait_for(lk, timeout);
-        if (stat == std::cv_status::timeout) {
-            return false;
-        }
-        bool r = this->chan_->queue.dequeue(elem);
-        assert(r);
-        return true;
+        bool r = this->chan_->cond.wait_for(lk, timeout, [&]() {
+            return chan_->queue.dequeue_moved(elem);
+        });
+        return r;
     }
 
     template<class Clock, class Duration>
@@ -212,13 +243,10 @@ public:
             return true;
         }
         std::unique_lock<std::mutex> lk(this->chan_->mut);
-        std::cv_status stat = this->chan_->cond.wait_until(lk, deadline);
-        if (stat == std::cv_status::timeout) {
-            return false;
-        }
-        bool r = this->chan_->queue.dequeue(elem);
-        assert(r);
-        return true;
+        bool r = this->chan_->cond.wait_until(lk, deadline, [&]() {
+            return chan_->queue.dequeue_moved(elem);
+        });
+        return r;
     }
 
 private:
